@@ -7,11 +7,8 @@ import io
 import requests
 import threading
 import json
-from dotenv import load_dotenv
 import os
-load_dotenv()
-# --- CONFIGURACIÓN --- #
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+from config_manager import load_config, update_config, get_api_key, set_api_key, ask_for_api_key, validate_api_key
 
 DEFAULT_MODEL = "Qwen2.5 VL 72B (Free)"
 # Número de capturas antes de actualizar automáticamente el uso de API
@@ -64,18 +61,47 @@ class RecorteApp:
         master.geometry("400x400")
         master.resizable(False, False)
 
-        self.prompt_excel = """Convierte esta imagen a un archivo Excel respetando al máximo la apariencia visual original.
+        # Cargar configuración
+        self.config = load_config()
+        
+        # Verificar y obtener API key
+        self.api_key = get_api_key()
+        while not self.api_key or not validate_api_key(self.api_key):
+            self.api_key = ask_for_api_key(master)
+            if not self.api_key:
+                # Si el usuario cancela el diálogo, preguntar si quiere salir
+                if messagebox.askyesno("Salir", "¿Deseas salir de la aplicación? Se requiere una API key válida para continuar."):
+                    master.destroy()
+                    return
+                else:
+                    continue  # Volver a pedir la API key
+            elif not validate_api_key(self.api_key):
+                # API key inválida, mostrar error y volver a pedir
+                messagebox.showerror("Error", 
+                    "API key inválida. La clave debe:\n"
+                    "- Tener al menos 20 caracteres\n"
+                    "- Empezar con 'sk-'\n"
+                    "- Ser una clave válida de OpenRouter\n\n"
+                    "Por favor intenta de nuevo.")
+                continue
+            else:
+                # API key válida, guardarla
+                set_api_key(self.api_key)
+                break
+
+        # Cargar prompts desde configuración
+        self.prompt_excel = self.config.get('prompt_excel', """Convierte esta imagen a un archivo Excel respetando al máximo la apariencia visual original.
 No reorganices, no reinterpretes ni parafrasees ningún texto.
 Si algo no se puede leer claramente, coloca la palabra "ilegible" en su celda.
 Aunque no haya una estructura clara de columnas y filas, haz que el Excel se vea visualmente igual que la imagen, con los textos en sus posiciones relativas originales (alineaciones, espaciados, secciones separadas, etc.).
 No corrijas errores tipográficos ni completes nada que no esté explícitamente en la imagen.
-Sé lo más fiel posible al diseño, como si fuera una reconstrucción visual exacta."""
-        self.prompt_docs = """Extrae todo el texto legible de la imagen y respétalo tal cual aparece, sin parafrasear ni corregir errores.
+Sé lo más fiel posible al diseño, como si fuera una reconstrucción visual exacta.""")
+        self.prompt_docs = self.config.get('prompt_docs', """Extrae todo el texto legible de la imagen y respétalo tal cual aparece, sin parafrasear ni corregir errores.
 Si hay partes ilegibles, indícalo con la palabra "ilegible".
 No incluyas ningún texto adicional fuera del contenido extraído.
-El resultado debe estar listo para copiar y pegar en un documento de texto."""
+El resultado debe estar listo para copiar y pegar en un documento de texto.""")
         self.prompt_text = self.prompt_excel  # Inicializa con Excel
-        self.auto_process_post_capture = False  # Por defecto desactivado
+        self.auto_process_post_capture = self.config.get('auto_process_enabled', False)  # Cargar desde configuración
         
         # Variables para el seguimiento de uso de API
         self.api_usage = 0
@@ -93,7 +119,7 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         # Modo
         lbl_modo = Label(main_frame, text="Modo:", bg="#f7f7f7", anchor="w", justify="left")
         lbl_modo.grid(row=0, column=0, sticky="w", pady=(0, 10))
-        self.mode_var = StringVar(value="Excel")
+        self.mode_var = StringVar(value=self.config.get('output_mode', 'Excel'))
         self.mode_menu = ttk.Combobox(main_frame, textvariable=self.mode_var, values=["Excel", "Docs"], state="readonly", width=20)
         self.mode_menu.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(0, 10), padx=(20,0))
         self.mode_menu.bind("<<ComboboxSelected>>", self.check_mode_selection)
@@ -104,9 +130,10 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         # Proveedor IA
         lbl_prov = Label(main_frame, text="Proveedor IA:", bg="#f7f7f7", anchor="w", justify="left")
         lbl_prov.grid(row=1, column=0, sticky="w", pady=(0, 10))
-        self.provider_var = StringVar(value=DEFAULT_MODEL)
+        self.provider_var = StringVar(value=self.config.get('selected_model', DEFAULT_MODEL))
         self.provider_menu = ttk.Combobox(main_frame, textvariable=self.provider_var, values=list(MODEL_MAP.keys()), state="readonly", width=20)
         self.provider_menu.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 10), padx=(20,0))
+        self.provider_menu.bind("<<ComboboxSelected>>", self.on_model_change)
         self.provider_menu.bind("<Enter>", lambda e: self.provider_menu.config(cursor="hand2"))
         self.provider_menu.bind("<Leave>", lambda e: self.provider_menu.config(cursor="arrow"))
         crear_tooltip_label(lbl_prov, "Los modelos están organizados de más barato (arriba) a más caro (abajo). El costo depende del modelo seleccionado.")
@@ -143,11 +170,25 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         # Asegura que la sección de dimensiones esté correctamente oculta/visible al iniciar
         self.toggle_dimension_inputs()
 
-        prompt_button = Button(main_frame, text="Editar Prompt", command=self.abrir_ventana_prompt, bg="#f7f7f7", fg="black", font=("Helvetica", 10, "bold"), relief="raised", borderwidth=2, cursor="hand2")
-        prompt_button.grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
+        # Frame para botones secundarios (Editar Prompt y Restaurar Presets)
+        buttons_frame = Frame(main_frame, bg="#f7f7f7")
+        buttons_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
+        buttons_frame.grid_columnconfigure(0, weight=1)
+        buttons_frame.grid_columnconfigure(1, weight=1)
+        
+        # Botón Editar Prompt
+        prompt_button = Button(buttons_frame, text="Editar Prompt", command=self.abrir_ventana_prompt, bg="#f7f7f7", fg="black", font=("Helvetica", 10), relief="raised", borderwidth=2, cursor="hand2")
+        prompt_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         prompt_button.bind("<Enter>", lambda e: prompt_button.config(cursor="hand2"))
         prompt_button.bind("<Leave>", lambda e: prompt_button.config(cursor="arrow"))
         crear_tooltip_label(prompt_button, "Edita el prompt que se enviará a la IA.")
+        
+        # Botón Restaurar Presets
+        restore_button = Button(buttons_frame, text="Restaurar Presets", command=self.restaurar_presets, bg="#f7f7f7", fg="black", font=("Helvetica", 10), relief="raised", borderwidth=2, cursor="hand2")
+        restore_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        restore_button.bind("<Enter>", lambda e: restore_button.config(cursor="hand2"))
+        restore_button.bind("<Leave>", lambda e: restore_button.config(cursor="arrow"))
+        crear_tooltip_label(restore_button, "Restaura toda la configuración a los valores por defecto.")
 
         self.snip_button = Button(main_frame, text="Recortar y Procesar", command=self.crear_ventana_recorte, bg="#4CAF50", fg="white", font=("Helvetica", 10, "bold"), relief="raised", borderwidth=2, cursor="hand2")
         self.snip_button.grid(row=5, column=0, columnspan=4, sticky="ew", ipady=5)
@@ -155,7 +196,7 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         self.snip_button.bind("<Leave>", lambda e: self.snip_button.config(cursor="arrow"))
         crear_tooltip_label(self.snip_button, "Haz clic para seleccionar el área de la pantalla a procesar.")
 
-        self.auto_var = tk.BooleanVar(value=False)  # Por defecto desactivado
+        self.auto_var = tk.BooleanVar(value=self.config.get('auto_process_enabled', False))  # Cargar desde configuración
         auto_check = tk.Checkbutton(main_frame, text="Procesamiento automático post captura", variable=self.auto_var, command=self.actualizar_auto_config, bg="#f7f7f7", font=("Helvetica", 10), cursor="hand2")
         auto_check.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
         auto_check.bind("<Enter>", lambda e: auto_check.config(cursor="hand2"))
@@ -163,16 +204,23 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         crear_tooltip_label(auto_check, "Activado: Tras tomar la captura se procesará automáticamente.\nDesactivado: Tras tomar la captura se pedirá confirmación antes de procesar la imagen.")
         
         # Barra de uso de API
-        self.crear_barra_uso_api(main_frame)
+        self.crear_barra_uso_api(main_frame, row=7)
+        
+        # Botón para cambiar API key (discreto) - al final
+        api_key_button = Button(main_frame, text="Cambiar API Key", command=self.cambiar_api_key, bg="#f7f7f7", fg="#666666", font=("Helvetica", 8), relief="flat", borderwidth=0, cursor="hand2")
+        api_key_button.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(5, 2))
+        api_key_button.bind("<Enter>", lambda e: api_key_button.config(cursor="hand2", fg="#333333"))
+        api_key_button.bind("<Leave>", lambda e: api_key_button.config(cursor="arrow", fg="#666666"))
+        crear_tooltip_label(api_key_button, "Cambia tu API key de OpenRouter")
         
         # Cargar datos de uso inicial
         self.actualizar_uso_api()
 
-    def crear_barra_uso_api(self, parent):
+    def crear_barra_uso_api(self, parent, row=7):
         """Crea la barra de uso de API en la interfaz"""
         # Frame para la barra de uso
         self.uso_frame = Frame(parent, bg="#f7f7f7")
-        self.uso_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.uso_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         
         # Label de créditos con emoji
         self.lbl_creditos = Label(self.uso_frame, text="💰 API:", bg="#f7f7f7", font=("Helvetica", 9))
@@ -197,7 +245,30 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         
         # Tooltip para la barra de uso
         crear_tooltip_label(self.lbl_creditos, "Muestra el uso actual de créditos de la API de OpenRouter.\nVerde: Uso bajo, Amarillo: Uso medio, Rojo: Uso alto")
-        crear_tooltip_label(self.btn_actualizar, "Actualizar información de uso de API")
+        crear_tooltip_label(self.btn_actualizar, "Actualizar información de uso de API.")
+
+    def cambiar_api_key(self):
+        """Permite al usuario cambiar su API key"""
+        while True:
+            new_api_key = ask_for_api_key(self.master)
+            if not new_api_key:
+                # Usuario canceló el diálogo
+                break
+            elif validate_api_key(new_api_key):
+                set_api_key(new_api_key)
+                self.api_key = new_api_key
+                messagebox.showinfo("Éxito", "API key actualizada correctamente.")
+                # Actualizar uso de API con la nueva clave
+                self.actualizar_uso_api()
+                break
+            else:
+                # API key inválida, mostrar error y volver a pedir
+                messagebox.showerror("Error", 
+                    "API key inválida. La clave debe:\n"
+                    "- Tener al menos 20 caracteres\n"
+                    "- Empezar con 'sk-'\n"
+                    "- Ser una clave válida de OpenRouter\n\n"
+                    "Por favor intenta de nuevo.")
 
     def obtener_uso_api(self):
         """Obtiene la información de uso de la API de OpenRouter"""
@@ -205,7 +276,7 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
             response = requests.get(
                 "https://openrouter.ai/api/v1/key",
                 headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}"
+                    "Authorization": f"Bearer {self.api_key}"
                 },
                 timeout=10
             )
@@ -291,18 +362,70 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
     def abrir_ventana_prompt(self):
         prompt_window = Toplevel(self.master)
         prompt_window.title("Editor de Prompt")
-        prompt_window.geometry("500x350")
-        text_widget = Text(prompt_window, wrap="word", padx=10, pady=10, font=("Helvetica", 10))
-        text_widget.pack(fill="both", expand=True)
+        prompt_window.geometry("600x500")
+        prompt_window.resizable(True, True)
+        
+        # Centrar la ventana
+        prompt_window.update_idletasks()
+        x = (prompt_window.winfo_screenwidth() // 2) - (600 // 2)
+        y = (prompt_window.winfo_screenheight() // 2) - (500 // 2)
+        prompt_window.geometry(f"600x500+{x}+{y}")
+        
+        # Frame principal con grid para mejor control
+        main_frame = tk.Frame(prompt_window)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        main_frame.grid_rowconfigure(1, weight=1)  # La fila del texto se expande
+        main_frame.grid_columnconfigure(0, weight=1)
+        
+        # Título
+        title_label = tk.Label(main_frame, text="Editor de Prompt", font=("Helvetica", 12, "bold"))
+        title_label.grid(row=0, column=0, pady=(0, 10), sticky="w")
+        
+        # Frame para el texto (con altura fija)
+        text_frame = tk.Frame(main_frame)
+        text_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(0, weight=1)
+        
+        # Widget de texto
+        text_widget = Text(text_frame, wrap="word", padx=10, pady=10, font=("Helvetica", 10))
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        
+        # Scrollbar
+        scrollbar = tk.Scrollbar(text_frame, orient="vertical", command=text_widget.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text_widget.config(yscrollcommand=scrollbar.set)
+        
         # Muestra el prompt según el modo actual
         if self.mode_var.get() == "Excel":
             text_widget.insert("1.0", self.prompt_excel)
         else:
             text_widget.insert("1.0", self.prompt_docs)
-        btn_guardar = Button(prompt_window, text="Guardar", command=lambda: self.set_prompt_and_close(text_widget, prompt_window), bg="#4CAF50", fg="white", cursor="hand2")
-        btn_guardar.pack(pady=10)
-        btn_guardar.bind("<Enter>", lambda e: btn_guardar.config(cursor="hand2"))
-        btn_guardar.bind("<Leave>", lambda e: btn_guardar.config(cursor="arrow"))
+        
+        # Frame para botones (altura fija)
+        button_frame = tk.Frame(main_frame)
+        button_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        
+        # Botón Guardar
+        btn_guardar = Button(button_frame, text="Guardar Cambios", 
+                           command=lambda: self.set_prompt_and_close(text_widget, prompt_window), 
+                           bg="#4CAF50", fg="white", font=("Helvetica", 10, "bold"), 
+                           cursor="hand2", width=15, height=2)
+        btn_guardar.pack(side="left", padx=(0, 10))
+        
+        # Botón Cancelar
+        btn_cancelar = Button(button_frame, text="Cancelar", 
+                            command=prompt_window.destroy, 
+                            bg="#f44336", fg="white", font=("Helvetica", 10), 
+                            cursor="hand2", width=15, height=2)
+        btn_cancelar.pack(side="left")
+        
+        # Bind Enter para guardar
+        text_widget.bind("<Control-Return>", lambda e: self.set_prompt_and_close(text_widget, prompt_window))
+        prompt_window.bind("<Escape>", lambda e: prompt_window.destroy())
+        
+        # Enfocar el texto
+        text_widget.focus()
 
     def set_prompt_and_close(self, widget, window):
         texto = widget.get("1.0", "end-1c")
@@ -310,10 +433,44 @@ El resultado debe estar listo para copiar y pegar en un documento de texto."""
         if self.mode_var.get() == "Excel":
             self.prompt_excel = texto
             self.prompt_text = self.prompt_excel
+            update_config('prompt_excel', texto)
         else:
             self.prompt_docs = texto
             self.prompt_text = self.prompt_docs
+            update_config('prompt_docs', texto)
         window.destroy()
+
+    def restaurar_presets(self):
+        """Restaura toda la configuración a los valores por defecto"""
+        if messagebox.askyesno("Restaurar Presets", 
+                              "¿Estás seguro de que quieres restaurar TODA la configuración a los valores por defecto?\n\n"
+                              "Esto sobrescribirá:\n"
+                              "- Modelo seleccionado\n"
+                              "- Modo de salida\n"
+                              "- Prompts personalizados\n"
+                              "- Configuración de procesamiento automático\n\n"
+                              "La API key se mantendrá."):
+            
+            # Obtener la configuración por defecto del config_manager
+            from config_manager import DEFAULT_CONFIG
+            
+            # Restaurar TODA la configuración por defecto
+            for key, value in DEFAULT_CONFIG.items():
+                update_config(key, value)
+            
+            # Actualizar variables locales
+            self.prompt_excel = DEFAULT_CONFIG['prompt_excel']
+            self.prompt_docs = DEFAULT_CONFIG['prompt_docs']
+            self.prompt_text = self.prompt_excel  # Actualizar prompt activo
+            
+            # Actualizar UI
+            self.provider_var.set(DEFAULT_CONFIG['selected_model'])
+            self.mode_var.set(DEFAULT_CONFIG['output_mode'])
+            self.auto_var.set(DEFAULT_CONFIG['auto_process_enabled'])
+            self.auto_process_post_capture = DEFAULT_CONFIG['auto_process_enabled']
+            
+                         # Actualizar dimensiones si es necesario
+            self.toggle_dimension_inputs()
 
     def crear_ventana_recorte(self):
         self.master.withdraw()
@@ -485,7 +642,7 @@ Si alguna columna o fila no cuadra con lo que percibes en la imagen, puedes deja
             response = requests.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}"
+                    "Authorization": f"Bearer {self.api_key}"
                 },
                 json=payload
             )
@@ -597,7 +754,7 @@ Extrae todo el texto legible de la imagen y respétalo tal cual aparece, sin par
             response = requests.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}"
+                    "Authorization": f"Bearer {self.api_key}"
                 },
                 json=payload
             )
@@ -650,6 +807,11 @@ Extrae todo el texto legible de la imagen y respétalo tal cual aparece, sin par
 
     def actualizar_auto_config(self):
         self.auto_process_post_capture = self.auto_var.get()
+        update_config('auto_process_enabled', self.auto_process_post_capture)
+
+    def on_model_change(self, event=None):
+        """Guarda el modelo seleccionado en la configuración"""
+        update_config('selected_model', self.provider_var.get())
 
     def check_mode_selection(self, event=None):
         # Oculta dimensiones si selecciona Docs, muestra si Excel
@@ -659,20 +821,13 @@ Extrae todo el texto legible de la imagen y respétalo tal cual aparece, sin par
             self.prompt_text = self.prompt_excel
         else:
             self.prompt_text = self.prompt_docs
+        # Guardar el modo seleccionado en la configuración
+        update_config('output_mode', self.mode_var.get())
 
     def _validate_numeric(self, value):
         return value.isdigit() or value == ""
 
 def main():
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.strip() == "":
-        messagebox.showerror(
-            "API Key no configurada",
-            "No se ha encontrado una API Key válida para OpenRouter.\n\n"
-            "Verifica que esté definida en el archivo .env como:\n\n"
-            "OPENROUTER_API_KEY=tu_clave_aqui"
-        )
-        return  # Detiene el programa si no hay API key
-
     try:
         root = tk.Tk()
         # Cambia el icono de la ventana principal
